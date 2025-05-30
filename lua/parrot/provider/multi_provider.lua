@@ -222,7 +222,15 @@ function MultiProvider:new(config)
   -- Validate required fields
   assert(config.name, "Provider name is required")
   assert(config.endpoint, "Provider endpoint is required")
-  assert(config.api_key, "Provider API key is required")
+  
+  -- Special handling for Anthropic Max Plan (API key not required)
+  if config.name == "anthropic" and config.use_max_plan then
+    self.use_max_plan = true
+    config.api_key = config.api_key or "" -- Not required for Max Plan
+  else
+    assert(config.api_key, "Provider API key is required")
+  end
+  
   assert(config.model or config.models, "Provider model(s) are required")
 
   -- Basic configuration
@@ -231,6 +239,7 @@ function MultiProvider:new(config)
   self.model_endpoint = config.model_endpoint or ""
   self.api_key = config.api_key
   self.models = config.model or config.models
+  self.use_max_plan = config.use_max_plan or false
 
   -- Function overrides (use defaults if not provided)
   self.headers = config.headers or defaults.headers
@@ -239,6 +248,31 @@ function MultiProvider:new(config)
   self.process_onexit_func = config.process_onexit or defaults.process_onexit
   self.resolve_api_key_func = config.resolve_api_key or defaults.resolve_api_key
   self.get_available_models_func = config.get_available_models or defaults.get_available_models
+  
+  -- Special Anthropic configuration
+  if self.name == "anthropic" then
+    if not self.use_max_plan then
+      -- Standard Anthropic API - set headers and preprocessing
+      self.headers = config.headers or function(provider)
+        return {
+          ["Content-Type"] = "application/json",
+          ["x-api-key"] = provider.api_key,
+          ["anthropic-version"] = "2023-06-01",
+        }
+      end
+      
+      self.preprocess_payload_func = config.preprocess_payload or function(payload)
+        for _, message in ipairs(payload.messages) do
+          message.content = message.content:gsub("^%s*(.-)%s*$", "%1")
+        end
+        if payload.messages[1] and payload.messages[1].role == "system" then
+          payload.system = payload.messages[1].content
+          table.remove(payload.messages, 1)
+        end
+        return payload
+      end
+    end
+  end
 
   self:validate_config()
   return self
@@ -398,6 +432,11 @@ end
 ---@param api_key string|table|function
 ---@return string|false trimmed or resolved API key, or false on error
 function MultiProvider:resolve_api_key(api_key)
+  -- For Anthropic Max Plan, no API key validation needed
+  if self.name == "anthropic" and self.use_max_plan then
+    return "max_plan_placeholder"
+  end
+  
   return self.resolve_api_key_func(self, api_key)
 end
 
@@ -405,12 +444,22 @@ end
 ---@param response string
 ---@return string|nil
 function MultiProvider:process_stdout(response)
+  -- For Anthropic Max Plan, return plain text response
+  if self.name == "anthropic" and self.use_max_plan then
+    return response
+  end
+  
   return self.process_stdout_func(response)
 end
 
 -- Processes the onexit event from the API response
 ---@param res string
 function MultiProvider:process_onexit(res)
+  -- For Anthropic Max Plan, no JSON processing needed
+  if self.name == "anthropic" and self.use_max_plan then
+    return nil
+  end
+  
   return self.process_onexit_func(res)
 end
 
@@ -444,6 +493,59 @@ function MultiProvider:get_available_models()
     return self.get_available_models_func(self, args)
   end
   return self.models
+end
+
+-- Generate CLI command for Anthropic Max Plan
+---@param payload table
+---@return string command
+---@return table args  
+---@return string prompt
+function MultiProvider:get_cli_command(payload)
+  if not (self.name == "anthropic" and self.use_max_plan) then
+    error("get_cli_command is only available for Anthropic Max Plan")
+  end
+  
+  local model = payload.model
+  local messages = payload.messages
+  local system = payload.system
+  
+  -- Build prompt from messages
+  local prompt_parts = {}
+  
+  if system then
+    table.insert(prompt_parts, "System: " .. system)
+    table.insert(prompt_parts, "")
+  end
+  
+  for _, message in ipairs(messages) do
+    if message.role == "user" then
+      table.insert(prompt_parts, "Human: " .. message.content)
+    elseif message.role == "assistant" then
+      table.insert(prompt_parts, "Assistant: " .. message.content)
+    end
+  end
+  
+  table.insert(prompt_parts, "")
+  table.insert(prompt_parts, "Assistant:")
+  
+  local prompt = table.concat(prompt_parts, "\n")
+  
+  -- Build CLI arguments
+  local args = { "-p" }
+  
+  if model and model ~= "" then
+    table.insert(args, "--model")
+    table.insert(args, model)
+  end
+  
+  logger.debug(vim.inspect({
+    msg = "CLI command args",
+    command = "claude",
+    args = args,
+    prompt_preview = string.sub(prompt, 1, 100) .. "...",
+  }))
+  
+  return "claude", args, prompt
 end
 
 return MultiProvider
