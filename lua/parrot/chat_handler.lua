@@ -1706,101 +1706,175 @@ function ChatHandler:query(buf, provider, payload, handler, on_exit)
 
   self.queries:cleanup(8, 60)
 
-  local curl_params = vim.deepcopy(self.options.curl_params or {})
   payload = provider:preprocess_payload(payload)
-  local args = {
-    "--no-buffer",
-    "--silent",
-    "-d",
-    "@-",
-  }
-
-  for _, parg in ipairs(provider:curl_params()) do
-    table.insert(curl_params, parg)
-  end
-
-  for _, arg in ipairs(args) do
-    table.insert(curl_params, arg)
-  end
-
-  local json_payload = vim.json.encode(payload)
-  logger.debug(vim.inspect({
-    msg = "Query json payload",
-    method = "ChatHandler:query",
-    json_payload = json_payload,
-  }))
-
-  local job = Job:new({
-    command = "curl",
-    args = curl_params,
-    writer = json_payload,
-    on_exit = function(response, exit_code)
-      logger.debug(vim.inspect({
-        msg = "on_exit",
-        method = "ChatHandler:query",
-        response = response:result(),
-      }))
-      if exit_code ~= 0 then
-        logger.error(vim.inspect({
-          msg = "on_exit: calling curl failed with exit code",
+  
+  local job
+  if provider.use_max_plan and provider.get_cli_command then
+    -- Use Claude CLI for Max Plan users
+    local command, args, prompt_text = provider:get_cli_command(payload)
+    logger.debug(vim.inspect({
+      msg = "Using Claude CLI",
+      method = "ChatHandler:query",
+      command = command,
+      args = args,
+      prompt_length = string.len(prompt_text),
+    }))
+    
+    job = Job:new({
+      command = command,
+      args = args,
+      writer = prompt_text, -- Use stdin for the prompt
+      on_exit = function(response, exit_code)
+        logger.debug(vim.inspect({
+          msg = "on_exit (CLI)",
           method = "ChatHandler:query",
           exit_code = exit_code,
           response = response:result(),
         }))
+        if exit_code ~= 0 then
+          local error_msg = table.concat(response:result(), "\n")
+          logger.error(vim.inspect({
+            msg = "on_exit: CLI command failed with exit code",
+            method = "ChatHandler:query",
+            exit_code = exit_code,
+            response = response:result(),
+          }))
+          if on_exit then
+            on_exit(qid)
+          end
+          return
+        end
+        
+        if response.handle and not response.handle:is_closing() then
+          response.handle:close()
+        end
+        
         if on_exit then
           on_exit(qid)
         end
-      end
-      local result = response:result()
-      result = utils.parse_raw_response(result)
-
-      local exit_content = provider:process_onexit(result)
-      if exit_content then
+        
+        local qt = self.queries:get(qid)
+        if qt and qt.ns_id and qt.buf then
+          vim.schedule(function()
+            pcall(vim.api.nvim_buf_clear_namespace, qt.buf, qt.ns_id, 0, -1)
+          end)
+        end
+        self.pool:remove(response.pid)
+      end,
+      on_stdout = function(_, data)
+        logger.debug(vim.inspect({
+          msg = "on_stdout (CLI)",
+          method = "ChatHandler:query",
+          data = data,
+        }))
         local qt = self.queries:get(qid)
         if not qt then
           return
         end
-        qt.response = qt.response .. exit_content
-        handler(qid, exit_content)
-      end
+        
+        -- Stream each line of output
+        qt.response = qt.response .. data
+        handler(qid, data)
+      end,
+    })
+  else
+    -- Use API mode with curl
+    local curl_params = vim.deepcopy(self.options.curl_params or {})
+    local args = {
+      "--no-buffer",
+      "--silent",
+      "-d",
+      "@-",
+    }
 
-      if response.handle and not response.handle:is_closing() then
-        response.handle:close()
-      end
+    for _, parg in ipairs(provider:curl_params()) do
+      table.insert(curl_params, parg)
+    end
 
-      if on_exit then
-        on_exit(qid)
-      end
-      local qt = self.queries:get(qid)
-      if qt and qt.ns_id and qt.buf then
-        vim.schedule(function()
-          pcall(vim.api.nvim_buf_clear_namespace, qt.buf, qt.ns_id, 0, -1)
-        end)
-      end
-      self.pool:remove(response.pid)
-    end,
-    on_stdout = function(_, data)
-      logger.debug(vim.inspect({
-        msg = "on_stdout",
-        method = "ChatHandler:query",
-        data = data,
-      }))
-      local qt = self.queries:get(qid)
-      if not qt then
-        return
-      end
+    for _, arg in ipairs(args) do
+      table.insert(curl_params, arg)
+    end
 
-      local lines = vim.split(data, "\n")
-      for _, line in ipairs(lines) do
-        local raw_json = string.gsub(line, "^data:", "")
-        local content = provider:process_stdout(raw_json)
-        if type(content) == "string" and #content > 0 then
-          qt.response = qt.response .. content
-          handler(qid, content)
+    local json_payload = vim.json.encode(payload)
+    logger.debug(vim.inspect({
+      msg = "Query json payload",
+      method = "ChatHandler:query",
+      json_payload = json_payload,
+    }))
+
+    job = Job:new({
+      command = "curl",
+      args = curl_params,
+      writer = json_payload,
+      on_exit = function(response, exit_code)
+        logger.debug(vim.inspect({
+          msg = "on_exit",
+          method = "ChatHandler:query",
+          response = response:result(),
+        }))
+        if exit_code ~= 0 then
+          logger.error(vim.inspect({
+            msg = "on_exit: calling curl failed with exit code",
+            method = "ChatHandler:query",
+            exit_code = exit_code,
+            response = response:result(),
+          }))
+          if on_exit then
+            on_exit(qid)
+          end
         end
-      end
-    end,
-  })
+        local result = response:result()
+        result = utils.parse_raw_response(result)
+
+        local exit_content = provider:process_onexit(result)
+        if exit_content then
+          local qt = self.queries:get(qid)
+          if not qt then
+            return
+          end
+          qt.response = qt.response .. exit_content
+          handler(qid, exit_content)
+        end
+
+        if response.handle and not response.handle:is_closing() then
+          response.handle:close()
+        end
+
+        if on_exit then
+          on_exit(qid)
+        end
+        local qt = self.queries:get(qid)
+        if qt and qt.ns_id and qt.buf then
+          vim.schedule(function()
+            pcall(vim.api.nvim_buf_clear_namespace, qt.buf, qt.ns_id, 0, -1)
+          end)
+        end
+        self.pool:remove(response.pid)
+      end,
+      on_stdout = function(_, data)
+        logger.debug(vim.inspect({
+          msg = "on_stdout",
+          method = "ChatHandler:query",
+          data = data,
+        }))
+        local qt = self.queries:get(qid)
+        if not qt then
+          return
+        end
+
+        local lines = vim.split(data, "\n")
+        for _, line in ipairs(lines) do
+          local raw_json = string.gsub(line, "^data:", "")
+          local content = provider:process_stdout(raw_json)
+          if type(content) == "string" and #content > 0 then
+            qt.response = qt.response .. content
+            handler(qid, content)
+          end
+        end
+      end,
+    })
+  end
+  
   job:start()
   self.pool:add(job, buf)
   logger.debug(vim.inspect({

@@ -8,8 +8,9 @@ local M = {}
 M.init_provider = function(config)
   assert(config.name, "config.name is required")
   assert(config.endpoint, "config.endpoint is required")
-  assert(config.api_key, "config.api_key is required")
   assert(config.models, "config.model or config.models required")
+  
+  -- MultiProvider now handles Anthropic Max Plan validation internally
   return MultiProvider:new(config)
 end
 
